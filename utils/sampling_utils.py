@@ -1,3 +1,4 @@
+import random
 import numpy as np
 
 class SamplingUtils:
@@ -27,3 +28,33 @@ class SamplingUtils:
                 1.0
             )
         )
+
+    @staticmethod
+    def random_sampling(
+            rng:random.Random,
+            population:list,
+            weights:list|None=None
+        ):
+        """
+        Input:
+            rng: random.Random generator
+            population: 무작위로 뽑을 후보 값들의 목록
+            weights: 가중치 리스트, None일 경우 균등 선택
+        """
+        if weights is not None:
+            return rng.choices(
+                population=population,
+                weights=weights, 
+                k=1,
+            )[0]
+        else:
+            return rng.choices(
+                population=population,
+                k=1,
+            )[0]
+
+    @staticmethod
+    def alias_sampling():
+        """
+        구현 예정
+        """

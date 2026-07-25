@@ -3,6 +3,7 @@ import math
 from typing import Literal
 from bisect import bisect_right
 from .temporal_graph import TemporalGraph
+from utils import SamplingUtils
 
 class CTDNE_Graph(TemporalGraph):
     def __init__(self,
@@ -18,18 +19,21 @@ class CTDNE_Graph(TemporalGraph):
         """
         모든 temporal edge를 동일한 확률로 선택
         """
-        return self.rng.choice(self.edge_events)
+        return SamplingUtils.random_sampling(
+                rng=self.rng,
+                population=self.edge_events
+            )
 
     def select_temporal_edge_linear(self):
         """
         시간순 rank에 비례해 temporal edge 선택
         """
         n_edge=len(self.edge_events)
-        return self.rng.choices(
-            population=self.edge_events,
-            weights=range(1,n_edge+1), # 가장 최근 edge가 가중치 높도록 설정
-            k=1,
-        )[0]
+        return SamplingUtils.random_sampling(
+                rng=self.rng,
+                population=self.edge_events,
+                weights=range(1,n_edge+1) # 가장 최근 edge가 가중치 높도록 설정
+            )
 
     def select_temporal_edge_exponential(self,
             temperature:float=1.0
@@ -44,11 +48,11 @@ class CTDNE_Graph(TemporalGraph):
             math.exp((t-self.max_t)/temperature)
             for _,_,t in self.edge_events
         ]
-        return self.rng.choices(
-            population=self.edge_events,
-            weights=weights,
-            k=1,
-        )[0]
+        return SamplingUtils.random_sampling(
+                rng=self.rng,
+                population=self.edge_events,
+                weights=weights
+            )
 
     def select_temporal_neighbor_uniform(self,
             node:int,
@@ -111,11 +115,11 @@ class CTDNE_Graph(TemporalGraph):
         weights=list(
             range(n_candidate,0,-1)
         )
-        selected_idx=self.rng.choices(
+        selected_idx=SamplingUtils.random_sampling(
+            rng=self.rng,
             population=candidate_indices,
-            weights=weights,
-            k=1,
-        )[0]
+            weights=weights
+        )
         return self.adj[node][selected_idx],self.adj_t[node][selected_idx]
     
     def select_temporal_neighbor_exponential(self,
@@ -164,11 +168,11 @@ class CTDNE_Graph(TemporalGraph):
             math.exp(-(time_diff-min_time_diff))
             for time_diff in time_diffs
         ]
-        selected_idx=self.rng.choices(
+        selected_idx=SamplingUtils.random_sampling(
+            rng=self.rng,
             population=candidate_indices,
-            weights=weights,
-            k=1,
-        )[0]
+            weights=weights
+        )
         return self.adj[node][selected_idx],self.adj_t[node][selected_idx]
 
     def temporal_random_walk(self,
