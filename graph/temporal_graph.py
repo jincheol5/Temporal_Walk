@@ -43,7 +43,7 @@ class TemporalGraph:
     def set_random_seed(self,
             seed:int
         ):
-        self.sampling=random.Random(seed)
+        self.rng=random.Random(seed)
 
     def random_negative_sampling(self,
             src:torch.Tensor,
@@ -80,7 +80,7 @@ class TemporalGraph:
                 if node not in positive_dst_at_cur_t
                 and node!=source
             ]
-            neg_dst.append(self.sampling.choice(valid_candidates))
+            neg_dst.append(self.rng.choice(valid_candidates))
         return torch.tensor(
             neg_dst,
             dtype=src.dtype,

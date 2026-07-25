@@ -18,14 +18,14 @@ class CTDNE_Graph(TemporalGraph):
         """
         모든 temporal edge를 동일한 확률로 선택
         """
-        return self.sampling.choice(self.edge_events)
+        return self.rng.choice(self.edge_events)
 
     def select_temporal_edge_linear(self):
         """
         시간순 rank에 비례해 temporal edge 선택
         """
         n_edge=len(self.edge_events)
-        return self.sampling.choices(
+        return self.rng.choices(
             population=self.edge_events,
             weights=range(1,n_edge+1), # 가장 최근 edge가 가중치 높도록 설정
             k=1,
@@ -44,7 +44,7 @@ class CTDNE_Graph(TemporalGraph):
             math.exp((t-self.max_t)/temperature)
             for _,_,t in self.edge_events
         ]
-        return self.sampling.choices(
+        return self.rng.choices(
             population=self.edge_events,
             weights=weights,
             k=1,
@@ -75,7 +75,7 @@ class CTDNE_Graph(TemporalGraph):
             return None
 
         # [start_idx,len(timestamps)-1]에서 균등하게 index 선택
-        selected_idx=self.sampling.randrange(
+        selected_idx=self.rng.randrange(
             start_idx,
             len(timestamps),
         )
@@ -111,7 +111,7 @@ class CTDNE_Graph(TemporalGraph):
         weights=list(
             range(n_candidate,0,-1)
         )
-        selected_idx=self.sampling.choices(
+        selected_idx=self.rng.choices(
             population=candidate_indices,
             weights=weights,
             k=1,
@@ -164,7 +164,7 @@ class CTDNE_Graph(TemporalGraph):
             math.exp(-(time_diff-min_time_diff))
             for time_diff in time_diffs
         ]
-        selected_idx=self.sampling.choices(
+        selected_idx=self.rng.choices(
             population=candidate_indices,
             weights=weights,
             k=1,
