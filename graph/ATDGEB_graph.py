@@ -3,7 +3,7 @@ import math
 import numpy as np
 import networkx as nx
 from typing import Literal
-from collections import defaultdict
+from collections import defaultdict,deque
 from utils import SamplingUtils
 from .temporal_graph import TemporalGraph
 
@@ -11,9 +11,8 @@ class ATDGEB_Graph(TemporalGraph):
     """
     << now >>
     효율성을 위한 다음 기법들은 추후에 개발한다.
+        - Transform to time-expanded static graph
         - Alias sampling
-        - Path tree
-
 
     Local Structure Biased Sampling (LSBS)
     -> '현재 노드에서 어떤 이웃을 방문할 것인가?' 를 결정하는 이웃 샘플링 전략
@@ -41,93 +40,9 @@ class ATDGEB_Graph(TemporalGraph):
             target="i",
             create_using=nx.Graph() # Undirected Graph
         )
-        self.static_graph=None
         self.init_stru=None # 초기 local structure vector
         self.stru=None # aggregated local structure vector
         self.visit_prob=None # 각 노드의 인접 노드 사이의 기본 방문 점수(visit probability)
-
-    def transform_temporal_graph_to_static_graph(self):
-        """
-        temporal graph를 time-expanded static graph로 변환합니다.
-        node id는 (id,timestamp) tuple 로 구성된다. 
-        edge는 temporal edge, contact edge 두 종류가 생성된다.
-            temporal edge: (a,1) -> (a,2) -> (a,3)
-            contact edge: (a,1) -> (b,1), (b,5) -> (c,5)
-        """
-        df=self.graph_df.loc[:,["u", "i", "ts"]].copy()
-
-        # 결과 그래프는 시간 방향을 표현해야 하므로 directed graph 사용
-        self.static_graph=nx.DiGraph()
-
-        # 각 원래 노드가 활동한 timestamp 저장
-        node_active_times:dict[int,set[float]]=defaultdict(set)
-        for event in df.itertuples(index=False):
-            src=int(event.u)
-            dst=int(event.i)
-            timestamp=float(event.ts)
-            node_active_times[src].add(timestamp)
-            node_active_times[dst].add(timestamp)
-
-        # 시간별 복제 노드 생성
-        for original_node,active_times in node_active_times.items():
-            for timestamp in sorted(active_times):
-                expanded_node=(
-                    original_node,
-                    timestamp
-                )
-                self.static_graph.add_node(
-                    expanded_node,
-                    original_node=original_node,
-                    timestamp=timestamp
-                )
-
-        # 동일한 원래 노드의 복제 노드를 시간순으로 연결
-        for original_node,active_times in node_active_times.items():
-            sorted_times=sorted(active_times)
-            for previous_t,next_t in zip(
-                    sorted_times[:-1],
-                    sorted_times[1:]
-                ):
-                previous_node=(
-                    original_node,
-                    previous_t
-                )
-                next_node=(
-                    original_node,
-                    next_t
-                )
-                self.static_graph.add_edge(
-                    previous_node,
-                    next_node,
-                    edge_type="temporal",
-                    timestamp=next_t
-                )
-
-        # 원래 temporal interaction을 같은 시간의 노드끼리 연결
-        for event in df.itertuples(index=False):
-            src=int(event.u)
-            dst=int(event.i)
-            timestamp=float(event.ts)
-            expanded_src=(
-                src,
-                timestamp
-            )
-            expanded_dst=(
-                dst,
-                timestamp
-            )
-            self.static_graph.add_edge(
-                expanded_src,
-                expanded_dst,
-                edge_type="contact",
-                timestamp=timestamp
-            )
-            self.static_graph.add_edge(
-                expanded_dst,
-                expanded_src,
-                edge_type="contact",
-                timestamp=timestamp
-            )
 
     def detect_k_core_community(self,
             w_list:list
@@ -388,13 +303,143 @@ class ATDGEB_Graph(TemporalGraph):
         self.visit_prob=visit_prob
         return visit_prob
 
+    def DBSCAN_clustering(self,
+            node:int,
+            min_points:int=2
+        )->list[tuple[float,float]]:
+        """
+        논문의 adaptive sampling 전략에 따라 node의 active time을
+        1차원 DBSCAN으로 군집화한다.
+
+        Input:
+            node: active time을 군집화할 노드
+            min_points:
+                core point를 판별할 최소 이웃 수.
+                기준 시각 자기 자신도 이웃 수에 포함한다.
+        Output:
+            time_intervals:
+                각 cluster의 (최소 active time, 최대 active time) 목록.
+                noise point는 (active time, active time) 단일 구간으로
+                보존하며, 전체 구간은 시작 시간순으로 정렬한다.
+        """
+        if min_points<1:
+            raise ValueError(
+                "min_points는 1 이상이어야 합니다."
+            )
+
+        active_times=sorted(
+            set(
+                float(timestamp)
+                for timestamp in self.adj_t.get(node,[])
+            )
+        )
+        n_active_time=len(active_times)
+
+        if n_active_time==0: # 발생 시간 없으면 빈 리스트 반환
+            return []
+        if n_active_time==1: # 발생 시간이 하나뿐이면 해당 시간을 시작과 끝이 같은 구간으로 반환
+            active_time=active_times[0]
+            return [
+                (
+                    active_time,
+                    active_time
+                )
+            ]
+
+        # DBSCAN 반경 계산
+        # 논문의 식: r = TS_u / (|T_u| - 1)
+        radius=(
+            active_times[-1]-active_times[0]
+        )/(n_active_time-1)
+
+        # DBSCAN 상태 초기화
+        labels=[-1]*n_active_time # labels[i]: 각 발생 시각이 속한 군집 번호
+        visited=[False]*n_active_time # visited[i]: 해당 발생 시각을 검사했는지 표시
+        cluster_id=0 # 새 군집에 부여할 번호
+
+        def region_query(point_idx:int)->list[int]:
+            """
+            선택된 발생 시각과의 시간 차이가 radius 이하인 모든 발생 시각을 찾습니다.
+            """
+            point=active_times[point_idx]
+            return [
+                neighbor_idx
+                for neighbor_idx,neighbor in enumerate(active_times)
+                if abs(neighbor-point)<=radius
+            ]
+
+        for point_idx in range(n_active_time):
+            if visited[point_idx]:
+                continue
+
+            visited[point_idx]=True
+            neighbors=region_query(point_idx)
+            if len(neighbors)<min_points:
+                continue
+
+            labels[point_idx]=cluster_id
+            seeds=list(neighbors)
+            seed_set=set(seeds)
+            seed_idx=0
+
+            while seed_idx<len(seeds):
+                neighbor_idx=seeds[seed_idx]
+                seed_idx+=1
+
+                if not visited[neighbor_idx]:
+                    visited[neighbor_idx]=True
+                    neighbor_neighbors=region_query(neighbor_idx)
+                    if len(neighbor_neighbors)>=min_points:
+                        for candidate_idx in neighbor_neighbors:
+                            if candidate_idx not in seed_set:
+                                seeds.append(candidate_idx)
+                                seed_set.add(candidate_idx)
+
+                if labels[neighbor_idx]==-1:
+                    labels[neighbor_idx]=cluster_id
+
+            cluster_id+=1
+
+        time_intervals=[]
+        for current_cluster_id in range(cluster_id):
+            cluster=[
+                timestamp
+                for timestamp,label in zip(active_times,labels)
+                if label==current_cluster_id
+            ]
+            time_intervals.append(
+                (
+                    cluster[0],
+                    cluster[-1]
+                )
+            )
+
+        # 논문은 DBSCAN noise 처리 방법을 명시하지 않는다.
+        # noise를 제거하면 해당 시각의 temporal interaction이 walk
+        # 생성에서 완전히 제외되므로 각각 단일 시간 구간으로 보존한다.
+        time_intervals.extend(
+            (
+                timestamp,
+                timestamp
+            )
+            for timestamp,label in zip(active_times,labels)
+            if label==-1
+        )
+        return sorted(
+            time_intervals,
+            key=lambda interval:(
+                interval[0],
+                interval[1]
+            )
+        )
+
     def local_structure_biased_sampling(self,
             node:int,
             walk_path:list[int],
             time_interval:tuple[float,float]
         )->int|None:
         """
-        time-expanded static graph 기반으로 LSBS 수행.
+        Local Structure Biased Sampling (LSBS)
 
         Input:
             node: 현재 노드
@@ -402,4 +447,308 @@ class ATDGEB_Graph(TemporalGraph):
             time_interval: walk가 허용되는 시간 구간
         Output:
             sampled_neighbor: 선택된 다음 이웃 노드, 시간 구간 안에 방문 가능한 이웃이 없으면 None
-        """ 
+        """
+        if self.visit_prob is None:
+            raise Exception("visit probability 계산 필요.")
+        if len(time_interval)!=2:
+            raise ValueError(
+                "time_interval은 (start_time, end_time) 형식이어야 합니다."
+            )
+
+        start_time,end_time=time_interval
+        if start_time>end_time:
+            raise ValueError(
+                "time_interval의 시작 시간은 종료 시간보다 클 수 없습니다."
+            )
+        if walk_path and walk_path[-1]!=node:
+            raise ValueError(
+                "walk_path의 마지막 노드는 현재 node와 같아야 합니다."
+            )
+
+        # 동일한 이웃과 여러 번 접촉했더라도 sampling 후보에는 한 번만 포함한다.
+        # 주어진 시간 구간에 접촉한 이웃만 선택한다.
+        candidate_neighbors=[] # 실제 샘플링에 사용할 이웃 목록
+        candidate_set=set() # 같은 이웃이 중복으로 추가되는 것을 방지하는 집합
+        for neighbor,timestamp in zip(
+                self.adj.get(node,[]),
+                self.adj_t.get(node,[])
+            ):
+            if (
+                start_time<=timestamp<=end_time
+                and neighbor not in candidate_set
+            ):
+                candidate_neighbors.append(neighbor)
+                candidate_set.add(neighbor)
+
+        if not candidate_neighbors:
+            return None # valid 이웃 없음
+
+        weights=[]
+        is_start_node=len(walk_path)<=1
+        previous_node=(
+            None
+            if is_start_node
+            else walk_path[-2]
+        )
+
+        for neighbor in candidate_neighbors:
+            # 식 (4)로 미리 계산한 P(v, x)
+            weight=self.visit_prob.get(
+                node,{}
+            ).get(
+                neighbor,
+                0.0
+            )
+
+            if (
+                previous_node is not None
+                and neighbor!=previous_node
+                and self.topological_graph.has_edge(
+                    previous_node,
+                    neighbor
+                )
+            ):
+                # 식 (5)의 d(u, x)=1인 경우:
+                # P(u, x)가 더 크면 해당 확률로 갱신한다.
+                previous_weight=self.visit_prob.get(
+                    previous_node,{}
+                ).get(
+                    neighbor,
+                    0.0
+                )
+                if previous_weight>weight:
+                    weight=previous_weight
+
+            weights.append(weight)
+
+        # 모든 구조 유사도가 0이면 가중치 선택이 불가능하므로,
+        # 유효한 temporal neighbor 사이에서 균등하게 선택한다.
+        sampling_weights=(
+            weights
+            if any(weight>0.0 for weight in weights)
+            else None
+        )
+        return SamplingUtils.random_sampling(
+            rng=self.rng,
+            population=candidate_neighbors,
+            weights=sampling_weights
+        )
+
+    def get_walks_using_path_tree(self,
+            node:int,
+            time_interval:tuple[float,float],
+            max_walk_len:int=20,
+            n_sampling:int=1
+        )->list[list[int]]:
+        """
+        논문의 Algorithm 3 PathTree에 따라 주어진 시간 구간에서
+        temporal reachable walk path들을 생성한다.
+
+        Input:
+            node: path tree의 root node
+            time_interval: walk가 허용되는 시간 구간
+            max_walk_len: 하나의 walk에 포함할 최대 노드 수
+            n_sampling: 각 tree node에서 수행할 최대 LSBS 횟수
+        Output:
+            walks: list[list[int]], list of walk path
+        """
+        if len(time_interval)!=2:
+            raise ValueError(
+                "time_interval은 (start_time, end_time) 형식이어야 합니다."
+            )
+
+        start_time,end_time=time_interval
+        if start_time>end_time:
+            raise ValueError(
+                "time_interval의 시작 시간은 종료 시간보다 클 수 없습니다."
+            )
+        if max_walk_len<1:
+            raise ValueError(
+                "max_walk_len은 1 이상이어야 합니다."
+            )
+        if n_sampling<1:
+            raise ValueError(
+                "n_sampling 1 이상이어야 합니다."
+            )
+
+        # 각 queue item은 논문의 tree node instance에 해당한다.
+        # 동일한 원본 node도 서로 다른 parent나 arrival time을 가지면
+        # 별개의 tree node instance로 저장한다.
+        queue=deque([
+            {
+                "node":node,
+                "arrival_time":None,
+                "walk_path":[node],
+                "visited_states":set(),
+            }
+        ])
+        walks=[]
+
+        while queue:
+            tree_node=queue.popleft()
+
+            current_node=tree_node["node"]
+            arrival_time=tree_node["arrival_time"]
+            walk_path=tree_node["walk_path"]
+            visited_states=tree_node["visited_states"]
+
+            if len(walk_path)>=max_walk_len:
+                walks.append(walk_path)
+                continue
+
+            # root에서는 전체 interval을 사용하고, 이후에는 현재
+            # tree node의 arrival time 이후에 발생한 edge만 허용한다.
+            candidate_start=(
+                start_time
+                if arrival_time is None
+                else arrival_time
+            )
+
+            # 논문 line 9의 u.Arr_u < max(C_i)에 해당한다.
+            if (
+                arrival_time is not None
+                and arrival_time>=end_time
+            ):
+                walks.append(walk_path)
+                continue
+
+            # 시간 도달성을 만족하는 서로 다른 이웃과 각 이웃으로
+            # 이동할 수 있는 가장 이른 arrival time을 구한다.
+            eligible_arrival_times={}
+            for neighbor,timestamp in zip(
+                    self.adj.get(current_node,[]),
+                    self.adj_t.get(current_node,[])
+                ):
+                if candidate_start<=timestamp<=end_time:
+                    previous_timestamp=eligible_arrival_times.get(
+                        neighbor
+                    )
+                    if (
+                        previous_timestamp is None
+                        or timestamp<previous_timestamp
+                    ):
+                        eligible_arrival_times[neighbor]=timestamp
+
+            if not eligible_arrival_times:
+                walks.append(walk_path)
+                continue
+
+            # 모든 유효 이웃을 매 단계 확장하면 path tree의 크기가
+            # 지수적으로 증가하므로 지정한 횟수까지만 LSBS를 수행한다.
+            n_sampling=min(
+                len(eligible_arrival_times),
+                n_sampling
+            )
+            sampled_children=set()
+            child_created=False
+
+            for _ in range(n_sampling):
+                sampled_neighbor=self.local_structure_biased_sampling(
+                    node=current_node,
+                    walk_path=walk_path,
+                    time_interval=(
+                        candidate_start,
+                        end_time
+                    )
+                )
+                if (
+                    sampled_neighbor is None
+                    or sampled_neighbor in sampled_children
+                ):
+                    continue
+
+                sampled_children.add(sampled_neighbor)
+                next_arrival_time=eligible_arrival_times[
+                    sampled_neighbor
+                ]
+                next_state=(
+                    sampled_neighbor,
+                    next_arrival_time
+                )
+
+                # 같은 time-expanded node를 한 경로에서 다시 방문하면
+                # 동일 시각의 edge를 왕복하며 tree가 무한히 확장될 수 있다.
+                if next_state in visited_states:
+                    continue
+
+                next_visited_states=set(visited_states)
+                next_visited_states.add(
+                    (
+                        current_node,
+                        next_arrival_time
+                        if arrival_time is None
+                        else arrival_time
+                    )
+                )
+                next_visited_states.add(next_state)
+
+                queue.append(
+                    {
+                        "node":sampled_neighbor,
+                        "arrival_time":next_arrival_time,
+                        "walk_path":walk_path+[sampled_neighbor],
+                        "visited_states":next_visited_states,
+                    }
+                )
+                child_created=True
+
+            # 샘플 결과가 모두 중복 상태라 자식이 만들어지지 않은
+            # 경우에도 현재 tree node는 leaf이다.
+            if not child_created:
+                walks.append(walk_path)
+
+        return walks
+
+    def generate_walks(self,
+            k_list:list,
+            L:int,
+            min_points:int=2,
+            max_walk_len:int=20,
+            n_sampling:int=1
+        )->list[list[str]]:
+        """
+        Local structure vector와 visit probability를 계산한 뒤,
+        논문의 Algorithm 2에 따라 모든 노드의 active time을
+        clustering하고 각 time interval에서 path tree walk를 생성한다.
+
+        Input:
+            k_list: community detection에 사용할 k 목록
+            L: local structure vector aggregation 반복 횟수
+            min_points: DBSCAN core point를 판별할 최소 이웃 수
+            max_walk_len: 하나의 walk에 포함할 최대 노드 수
+            n_sampling: 각 tree node에서 수행할 최대 LSBS 횟수
+        Output:
+            walks: list[list[str]], list of walk path
+        """
+        if L<0:
+            raise ValueError(
+                "L은 0 이상이어야 합니다."
+            )
+
+        self.generate_init_local_struct_vec(k_list=k_list)
+        self.aggregate_local_struct_vec(L=L)
+        self.compute_visit_prob()
+
+        walks=[]
+        for node in range(1,self.n_node+1):
+            node=int(node)
+            time_intervals=self.DBSCAN_clustering(
+                node=node,
+                min_points=min_points
+            )
+
+            for time_interval in time_intervals:
+                node_walks=self.get_walks_using_path_tree(
+                    node=node,
+                    time_interval=time_interval,
+                    max_walk_len=max_walk_len,
+                    n_sampling=n_sampling
+                )
+                walks.extend(
+                    [
+                        str(walk_node)
+                        for walk_node in walk
+                    ]
+                    for walk in node_walks
+                )
+        return walks

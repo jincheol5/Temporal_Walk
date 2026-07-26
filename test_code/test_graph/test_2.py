@@ -80,6 +80,25 @@ def test_fn(**kwargs):
             print(f"aggregated local structure vector:")
             print(stru)
 
+        case 4:
+            """
+            Test.
+            ATDGEB_Graph.generate_walks()
+            """
+            dataset_name=f"enron"
+            data=DataUtils.preprocess_graph(dataset_name=dataset_name)
+            graph_df=data["graph_df"]
+            bipartite=data["bipartite"]
+            graph=ATDGEB_Graph(
+                graph_df=graph_df,
+                bipartite=bipartite
+            )
+            graph.set_random_seed(seed=1)
+
+            k_list=[2,4,6]
+            L=3
+            walks=graph.generate_walks(k_list=k_list,L=L)
+            print(walks)
 
 if __name__=="__main__":
     """
