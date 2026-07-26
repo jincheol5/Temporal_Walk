@@ -47,11 +47,12 @@ def test_fn(**kwargs):
             )
 
             ### 4. evaulate model
-            ModelTrainer.evaluate_link_prediction(
+            result=ModelTrainer.evaluate_link_prediction(
                 model=model,
                 data_loader=test_loader,
                 **kwargs
             )
+            print(f"Evaluate ACC: {result["acc"]}")
 
 if __name__=="__main__":
     """

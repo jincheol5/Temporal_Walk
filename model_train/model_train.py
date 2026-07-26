@@ -106,7 +106,8 @@ class ModelTrainer:
             """
             validate model
             """
-            ModelTrainer.evaluate_link_prediction(model=model,data_loader=val_loader,**kwargs)
+            result=ModelTrainer.evaluate_link_prediction(model=model,data_loader=val_loader,**kwargs)
+            print(f"Validate ACC: {result["acc"]}")
         return model
 
     @staticmethod
@@ -167,7 +168,6 @@ class ModelTrainer:
                 )
                 acc_list.append(batch_acc)
         acc=sum(acc_list)/len(acc_list)
-        print(f"ACC: {acc}")
         return {
             "acc":acc
         }
