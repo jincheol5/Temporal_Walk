@@ -1,13 +1,13 @@
 import argparse
 from torch.utils.data import DataLoader
 from utils import DataUtils,TrainUtils,TemporalGraphDataset
-from graph import CTDNE_Graph
-from model import CTDNE_Link_Prediction
+from graph import ATDGEB_Graph
+from model import ATDGEB_Link_Prediction
 from model_train import ModelTrainer
 
 """
 << Test >> 
-CTDNE
+ATDGEB
 """
 def test_fn(**kwargs):
     match kwargs['test_num']:
@@ -21,8 +21,8 @@ def test_fn(**kwargs):
             )
             graph_df=data["graph_df"]
             bipartite=data["bipartite"]
-            graph=CTDNE_Graph(graph_df=graph_df,bipartite=bipartite)
-            model=CTDNE_Link_Prediction(
+            graph=ATDGEB_Graph(graph_df=graph_df,bipartite=bipartite)
+            model=ATDGEB_Link_Prediction(
                 embed_dim=kwargs["embed_dim"],
                 latent_dim=kwargs["latent_dim"],
                 window=kwargs["window"],
@@ -64,15 +64,13 @@ if __name__=="__main__":
     parser.add_argument("--latent_dim",type=int,default=4)
     parser.add_argument("--window",type=int,default=3)
 
-    # CTDNE
-    parser.add_argument("--model_name",type=str,default=f"CTDNE")
-    parser.add_argument("--walk_len",type=int,default=5)
-    parser.add_argument("--min_walk_len",type=int,default=3)
-    parser.add_argument("--n_context_window",type=int,default=100)
-    parser.add_argument("--max_attempt",type=int,default=100)
-    parser.add_argument("--edge_sampling",type=str,default=f"uniform")
-    parser.add_argument("--neighbor_sampling",type=str,default=f"uniform")
-
+    # ATDGEB
+    parser.add_argument("--model_name",type=str,default=f"ATDGEB")
+    parser.add_argument("--L",type=int,default=2)
+    parser.add_argument("--min_points",type=int,default=2)
+    parser.add_argument("--max_walk_len",type=int,default=10)
+    parser.add_argument("--n_sampling",type=int,default=1)
+    
     parser.add_argument("--walk_epoch",type=int,default=10)
     parser.add_argument("--epoch",type=int,default=1)
     parser.add_argument("--lr",type=float,default=0.0005)
@@ -86,12 +84,10 @@ if __name__=="__main__":
         "latent_dim":args.latent_dim,
         "window":args.window,
         "model_name":args.model_name,
-        "walk_len":args.walk_len,
-        "min_walk_len":args.min_walk_len,
-        "n_context_window":args.n_context_window,
-        "max_attempt":args.max_attempt,
-        "edge_sampling":args.edge_sampling,
-        "neighbor_sampling":args.neighbor_sampling,
+        "L":args.L,
+        "min_points":args.min_points,
+        "max_walk_len":args.max_walk_len,
+        "n_sampling":args.n_sampling,
         "walk_epoch":args.walk_epoch,
         "epoch":args.epoch,
         "lr":args.lr,

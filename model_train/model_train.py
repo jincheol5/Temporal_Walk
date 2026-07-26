@@ -18,15 +18,29 @@ class ModelTrainer:
         """
         Train skip-gram
         """
-        model.train_skipgram(
-            walk_len=kwargs["walk_len"],
-            min_walk_len=kwargs["min_walk_len"],
-            n_context_window=kwargs["n_context_window"],
-            max_attempt=kwargs["max_attempt"],
-            edge_sampling=kwargs["edge_sampling"],
-            neighbor_sampling=kwargs["neighbor_sampling"],
-            epoch=kwargs["walk_epoch"]
-        )
+        match kwargs["model_name"]:
+            case "CTDNE":
+                model.train_skipgram(
+                    walk_len=kwargs["walk_len"],
+                    min_walk_len=kwargs["min_walk_len"],
+                    n_context_window=kwargs["n_context_window"],
+                    max_attempt=kwargs["max_attempt"],
+                    edge_sampling=kwargs["edge_sampling"],
+                    neighbor_sampling=kwargs["neighbor_sampling"],
+                    epoch=kwargs["walk_epoch"],
+                    seed=kwargs["seed"]
+                )
+            case "ATDGEB":
+                k_list=[2,4,6,8,10]
+                model.train_skipgram(
+                    k_list=k_list,
+                    L=kwargs["L"],
+                    min_points=kwargs["min_points"],
+                    max_walk_len=kwargs["max_walk_len"],
+                    n_sampling=kwargs["n_sampling"],
+                    epoch=kwargs["walk_epoch"],
+                    seed=kwargs["seed"]
+                )
         """
         Train decoder
         """

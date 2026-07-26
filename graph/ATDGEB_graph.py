@@ -704,7 +704,8 @@ class ATDGEB_Graph(TemporalGraph):
             L:int,
             min_points:int=2,
             max_walk_len:int=20,
-            n_sampling:int=1
+            n_sampling:int=1,
+            seed:int=1
         )->list[list[str]]:
         """
         Local structure vector와 visit probability를 계산한 뒤,
@@ -724,6 +725,7 @@ class ATDGEB_Graph(TemporalGraph):
             raise ValueError(
                 "L은 0 이상이어야 합니다."
             )
+        self.set_random_seed(seed=seed)
 
         self.generate_init_local_struct_vec(k_list=k_list)
         self.aggregate_local_struct_vec(L=L)
