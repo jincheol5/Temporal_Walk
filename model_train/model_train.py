@@ -2,50 +2,59 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from utils import TrainUtils,Metric
+from utils import TrainUtils,Metric,EarlyStopper
 
-class ModelTrainer:
+class WalkModelTrainer:
+    """
+    Walk-based Model 학습/평가
+
+    수정 필요
+    """
     @staticmethod
-    def train_link_prediction(
+    def train(
             model:nn.Module,
             train_loader:DataLoader,
-            val_loader:DataLoader,
+            val_sample_list:list,
+            SR_result:dict[str,torch.Tensor],
+            TR_result:dict[str,torch.Tensor],
             **kwargs
         ):
         """
-        """
-
-        """
-        Train skip-gram
+        Train Skip-Gram
         """
         match kwargs["model_name"]:
             case "CTDNE":
                 model.train_skipgram(
                     walk_len=kwargs["walk_len"],
                     min_walk_len=kwargs["min_walk_len"],
-                    n_context_window=kwargs["n_context_window"],
-                    max_attempt=kwargs["max_attempt"],
+                    n_walk=kwargs["n_walk"],
+                    n_window=kwargs["n_window"],
                     edge_sampling=kwargs["edge_sampling"],
                     neighbor_sampling=kwargs["neighbor_sampling"],
-                    epoch=kwargs["walk_epoch"],
-                    seed=kwargs["seed"]
+                    epoch=kwargs["walk_epoch"]
                 )
             case "ATDGEB":
-                k_list=[2,4,6,8,10]
                 model.train_skipgram(
-                    k_list=k_list,
-                    L=kwargs["L"],
+                    k_list=kwargs["k_list"],
+                    n_aggr=kwargs["n_aggr"],
                     min_points=kwargs["min_points"],
-                    max_walk_len=kwargs["max_walk_len"],
-                    n_sampling=kwargs["n_sampling"],
-                    epoch=kwargs["walk_epoch"],
-                    seed=kwargs["seed"]
+                    walk_len=kwargs["walk_len"],
+                    n_lsbs=kwargs["n_lsbs"],
+                    epoch=kwargs["walk_epoch"]
                 )
+        print(f"Finish to train Skip-Gram")
+
         """
-        Train decoder
+        Set GPU, Optimizer
         """
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            device=torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device=torch.device("mps")
+        else:
+            device=torch.device("cpu")
         model=model.to(device)
+
         if kwargs["optimizer"]=="adam":
             optimizer=torch.optim.Adam(
                 model.parameters(),
@@ -56,118 +65,173 @@ class ModelTrainer:
                 model.parameters(),
                 lr=kwargs["lr"]
             )
-        
+
+        """
+        Set Early Stopper
+        """
+        if kwargs["early_stop"]:
+            early_stop=EarlyStopper(patience=kwargs["patience"])
+
+        """
+        Model Train
+        """
         for epoch in tqdm(range(kwargs["epoch"]),desc=f"Model Training..."):
+            ### Epoch마다 train_sample_list 생성
+            train_sample_list=TrainUtils.get_TR_sample_list(
+                n_pair=kwargs["n_pair"],
+                data_loader=train_loader,
+                SR_result=SR_result,
+                TR_result=TR_result,
+                sampling=kwargs["sampling"]
+            )
+
             model.train()
-            model.graph.set_random_seed(epoch)
-            for src,dst,ts in tqdm(
-                    train_loader,
+            for batch_sample in tqdm(
+                    train_sample_list,
                     desc=f"Training epoch: {epoch+1}..."
                 ):
-                src=src.to(device) # [B,]
-                dst=dst.to(device) # [B,]
-                ts=ts.to(device) # [B,]
+                src=batch_sample["src"]
+                dst=batch_sample["dst"]
+                label=batch_sample["label"]
+                src=src.to(device)
+                dst=dst.to(device)
+                label=label.to(device)
 
-                ### negative sampling
-                neg_dst=model.graph.random_negative_sampling(
+                pred_logit=model(
                     src=src,
-                    event_t=ts
-                )
-                pos_edge={
-                    "src":src,
-                    "dst":dst
-                }
-                neg_edge={
-                    "src":src,
-                    "dst":neg_dst
-                }
-
-                ### Label
-                edge_label=TrainUtils.get_edge_label(
-                    pos_edge_size=src.size(0),
-                    neg_edge_size=neg_dst.size(0),
-                    device=device
-                ) # [2B,1]
-
-                ### Predict
-                pred_edge_logit=model(
-                    pos_edge=pos_edge,
-                    neg_edge=neg_edge
-                ) # [2B,1]
+                    dst=dst
+                ) # [n_sample,1]
+                pred_logit=pred_logit.squeeze(-1) # -> [n_sample,]
 
                 ### Loss
                 criterion=nn.BCEWithLogitsLoss()
-                loss=criterion(pred_edge_logit,edge_label)
+                loss=criterion(pred_logit,label)
 
                 ### backward
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
             """
-            validate model
+            Validate Model
             """
-            result=ModelTrainer.evaluate_link_prediction(model=model,data_loader=val_loader,**kwargs)
-            print(f"Validate ACC: {result["acc"]}")
+            val_result=WalkModelTrainer.validate(
+                model=model,
+                val_sample_list=val_sample_list,
+                **kwargs
+            )
+            val_acc=val_result["acc"]
+            print(f"Validate ACC: {val_acc}")
+
+            """
+            Check Early Stop
+            """
+            val_loss=val_result["loss"]
+            print(f"{epoch+1} epoch Validate Loss: {val_loss}")
+            if kwargs["early_stop"]:
+                pre_model=early_stop(
+                    val_loss=val_loss,
+                    model=model
+                )
+                if early_stop.early_stop:
+                    model=pre_model
+                    print(f"Early Stop in epoch {epoch+1}")
+                    break
         return model
 
     @staticmethod
-    def evaluate_link_prediction(
+    def validate(
+            model,
+            val_sample_list:list,
+            **kwargs
+        ):
+        if torch.cuda.is_available():
+            device=torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device=torch.device("mps")
+        else:
+            device=torch.device("cpu")
+        model.to(device)
+        model.eval()
+
+        """
+        compute validate loss and acc
+        """
+        loss_list=[]
+        acc_list=[]
+        with torch.no_grad():
+            for batch_sample in tqdm(val_sample_list,desc=f"Validate..."):
+                src=batch_sample["src"]
+                dst=batch_sample["dst"]
+                label=batch_sample["label"]
+                src=src.to(device)
+                dst=dst.to(device)
+                label=label.to(device)
+
+                pred_logit=model(
+                    src=src,
+                    dst=dst
+                ) # [n_sample,1]
+                pred_logit=pred_logit.squeeze(-1) # -> [n_sample,]
+
+                ### Loss
+                criterion=nn.BCEWithLogitsLoss()
+                batch_loss=criterion(pred_logit,label)
+                loss_list.append(batch_loss)
+
+                ### compute ACC
+                batch_acc=Metric.compute_accuracy(
+                    pred_logit=pred_logit,
+                    label=label
+                )
+                acc_list.append(batch_acc)
+        return {
+            "loss":torch.stack(loss_list).mean().item(),
+            "acc":sum(acc_list)/len(acc_list)
+        }
+
+    @staticmethod
+    def evaluate(
             model:nn.Module,
-            data_loader:DataLoader,
+            test_sample_list:list,
             **kwargs
         ):
         """
-        Evaluate model
         """
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            device=torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device=torch.device("mps")
+        else:
+            device=torch.device("cpu")
         model=model.to(device)
         model.eval()
-        model.graph.set_random_seed(kwargs["seed"])
 
         acc_list=[]
         with torch.no_grad():
-            for src,dst,ts in tqdm(
-                    data_loader,
+            for batch_sample in tqdm(
+                    test_sample_list,
                     desc=f"Evaluating..."
                 ):
-                src=src.to(device) # [B,]
-                dst=dst.to(device) # [B,]
-                ts=ts.to(device) # [B,]
+                src=batch_sample["src"]
+                dst=batch_sample["dst"]
+                label=batch_sample["label"]
+                src=src.to(device)
+                dst=dst.to(device)
+                label=label.to(device)
 
-                ### negative sampling
-                neg_dst=model.graph.random_negative_sampling(
+                pred_logit=model(
                     src=src,
-                    event_t=ts
-                )
-                pos_edge={
-                    "src":src,
-                    "dst":dst
-                }
-                neg_edge={
-                    "src":src,
-                    "dst":neg_dst
-                }
+                    dst=dst
+                ) # [n_sample,1]
+                pred_logit=pred_logit.squeeze(-1) # -> [n_sample,]
 
-                ### Label
-                edge_label=TrainUtils.get_edge_label(
-                    pos_edge_size=src.size(0),
-                    neg_edge_size=neg_dst.size(0),
-                    device=device
-                ) # [2B,1]
-
-                ### Predict
-                pred_edge_logit=model(
-                    pos_edge=pos_edge,
-                    neg_edge=neg_edge
-                ) # [2B,1]
-
-                ### Compute ACC
+                ### compute ACC
                 batch_acc=Metric.compute_accuracy(
-                    pred_logit=pred_edge_logit,
-                    label=edge_label
+                    pred_logit=pred_logit,
+                    label=label
                 )
                 acc_list.append(batch_acc)
-        acc=sum(acc_list)/len(acc_list)
         return {
-            "acc":acc
+            "acc":sum(acc_list)/len(acc_list)
         }

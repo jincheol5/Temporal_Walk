@@ -3,11 +3,11 @@ import torch.nn as nn
 from graph import ATDGEB_Graph
 from module import SkipGram
 
-class ATDGEB_Base(nn.Module):
+class ATDGEB(nn.Module):
     def __init__(self,
             embed_dim:int,
             latent_dim:int,
-            window:int,
+            window_size:int,
             graph:ATDGEB_Graph
         ):
         super().__init__()
@@ -17,7 +17,7 @@ class ATDGEB_Base(nn.Module):
 
         self.skip_gram=SkipGram(
             vector_size=embed_dim,
-            window=window
+            window_size=window_size
         )
         # row 0: padding, row 1 ~ N: 실제 node ID 1 ~ N
         self.node_ft=nn.Embedding(
@@ -27,6 +27,12 @@ class ATDGEB_Base(nn.Module):
         )
         # downstream 학습 시 노드 임베딩을 고정
         self.node_ft.weight.requires_grad_(False)
+
+        # decoder
+        self.decoder=nn.Linear(
+            in_features=embed_dim+embed_dim,
+            out_features=1
+        )
 
     def convert_SkipGram_to_torch_embedding(self):
         """
@@ -54,23 +60,21 @@ class ATDGEB_Base(nn.Module):
 
     def train_skipgram(self,
             k_list:list[int],
-            L:int,
-            min_points:int=2,
-            max_walk_len:int=10,
-            n_sampling:int=1,
-            epoch:int=1,
-            seed:int=1
+            n_aggr:int=2,
+            min_points:int=3,
+            walk_len:int=5,
+            n_lsbs:int=3,
+            epoch:int=5
         ):
         """
         """
         ### Walk 생성
         walks=self.graph.generate_walks(
             k_list=k_list,
-            L=L,
+            n_aggr=n_aggr,
             min_points=min_points,
-            max_walk_len=max_walk_len,
-            n_sampling=n_sampling,
-            seed=seed
+            walk_len=walk_len,
+            n_lsbs=n_lsbs
         )
 
         ### vocabulary 생성
@@ -89,64 +93,20 @@ class ATDGEB_Base(nn.Module):
         self.convert_SkipGram_to_torch_embedding()
         self.skipgram_trained=True
 
-    def forward(self):
-        return NotImplemented
-
-class ATDGEB_Link_Prediction(ATDGEB_Base):
-    def __init__(self, 
-            embed_dim:int,
-            latent_dim:int,
-            window:int,
-            graph:ATDGEB_Graph
-        ):
-        super(ATDGEB_Link_Prediction,self).__init__(
-            embed_dim=embed_dim, 
-            latent_dim=latent_dim, 
-            window=window,
-            graph=graph 
-        )
-        # decoder
-        self.decoder=nn.Sequential(
-            nn.Linear(
-                in_features=embed_dim+embed_dim,
-                out_features=latent_dim
-            ),
-            nn.ReLU(),
-            nn.Linear(
-                in_features=latent_dim,
-                out_features=1
-            )
-        )
     def forward(self,
-            pos_edge,
-            neg_edge
+            src:torch.Tensor,
+            dst:torch.Tensor
         ):
         """
         Input:
-            pos_edge: dict
-                key: src, dst
-                value: 
-                    src: [B,] 
-                    dst: [B,] 
-            neg_edge: dict
-                key: src, dst
-                value: 
-                    src: [B,] 
-                    dst: [B,] 
+            src: [B,] 
+            dst: [B,] 
+        Return:
+            pred_logit: [B,1]
         """
-        ### 0. unpack event dict
-        pos_src=pos_edge["src"]
-        pos_dst=pos_edge["dst"]
-        neg_src=neg_edge["src"]
-        neg_dst=neg_edge["dst"]
-
-        src=torch.concat([pos_src,neg_src],dim=0) # [2B,]
-        dst=torch.concat([pos_dst,neg_dst],dim=0) # [2B,]
-
         ### 1. current batch에 대한 embedding
         src_ft=self.node_ft(src)
         dst_ft=self.node_ft(dst)
-
-        link_ft=torch.concat([src_ft,dst_ft],dim=-1) # [2B,embed_dim+embed_dim]
-        pred_link_logit=self.decoder(link_ft) # [2B,1]
-        return pred_link_logit
+        pair_vec=torch.concat([src_ft,dst_ft],dim=-1) # [B,embed_dim+embed_dim]
+        pred_logit=self.decoder(pair_vec) # [B,1]
+        return pred_logit

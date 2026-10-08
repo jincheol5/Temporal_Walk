@@ -4,11 +4,11 @@ from typing import Literal
 from graph import CTDNE_Graph
 from module import SkipGram
 
-class CTDNE_Base(nn.Module):
+class CTDNE(nn.Module):
     def __init__(self,
             embed_dim:int,
             latent_dim:int,
-            window:int,
+            window_size:int,
             graph:CTDNE_Graph
         ):
         super().__init__()
@@ -18,7 +18,7 @@ class CTDNE_Base(nn.Module):
 
         self.skip_gram=SkipGram(
             vector_size=embed_dim,
-            window=window
+            window_size=window_size
         )
         # row 0: padding, row 1 ~ N: 실제 node ID 1 ~ N
         self.node_ft=nn.Embedding(
@@ -28,6 +28,12 @@ class CTDNE_Base(nn.Module):
         )
         # downstream 학습 시 노드 임베딩을 고정
         self.node_ft.weight.requires_grad_(False)
+
+        # decoder
+        self.decoder=nn.Linear(
+            in_features=embed_dim+embed_dim,
+            out_features=1
+        )
 
     def convert_SkipGram_to_torch_embedding(self):
         """
@@ -56,8 +62,8 @@ class CTDNE_Base(nn.Module):
     def train_skipgram(self,
             walk_len:int,
             min_walk_len:int,
-            n_context_window:int,
-            max_attempt:int=None,
+            n_walk:int,
+            n_window:int,
             edge_sampling:Literal[
                 "uniform",
                 "linear",
@@ -68,20 +74,26 @@ class CTDNE_Base(nn.Module):
                 "linear",
                 "exponential"
             ]="uniform",
-            epoch:int=1,
-            seed:int=1
+            epoch:int=5
         ):
         """
+        Input:
+            walk_len: 생성 walk 길이 (최대 길이)
+            min_walk_len: 최소 walk 길이, skip-gram의 window_size와 동일해야 한다 
+            n_walk: 각 source node마다 random walk n_walk번 수행
+            n_window: 생성 temporal context window, 전체 노드 수의 배수로 설정
+            edge_sampling: start edge event 선택 방식 
+            neighbor_sampling: 이웃 노드 선택 방식
+            epoch: skip-gram 학습 epoch
         """
         ### Walk 생성
         walks=self.graph.generate_walks(
             walk_len=walk_len,
             min_walk_len=min_walk_len,
-            n_context_window=n_context_window,
-            max_attempt=max_attempt,
+            n_walk=n_walk,
+            n_window=n_window,
             edge_sampling=edge_sampling,
-            neighbor_sampling=neighbor_sampling,
-            seed=seed
+            neighbor_sampling=neighbor_sampling
         )
 
         ### vocabulary 생성
@@ -100,64 +112,20 @@ class CTDNE_Base(nn.Module):
         self.convert_SkipGram_to_torch_embedding()
         self.skipgram_trained=True
 
-    def forward(self):
-        return NotImplemented
-
-class CTDNE_Link_Prediction(CTDNE_Base):
-    def __init__(self, 
-            embed_dim:int,
-            latent_dim:int,
-            window:int,
-            graph:CTDNE_Graph
-        ):
-        super(CTDNE_Link_Prediction,self).__init__(
-            embed_dim=embed_dim, 
-            latent_dim=latent_dim, 
-            window=window,
-            graph=graph 
-        )
-        # decoder
-        self.decoder=nn.Sequential(
-            nn.Linear(
-                in_features=embed_dim+embed_dim,
-                out_features=latent_dim
-            ),
-            nn.ReLU(),
-            nn.Linear(
-                in_features=latent_dim,
-                out_features=1
-            )
-        )
     def forward(self,
-            pos_edge,
-            neg_edge
+            src:torch.Tensor,
+            dst:torch.Tensor
         ):
         """
         Input:
-            pos_edge: dict
-                key: src, dst
-                value: 
-                    src: [B,] 
-                    dst: [B,] 
-            neg_edge: dict
-                key: src, dst
-                value: 
-                    src: [B,] 
-                    dst: [B,] 
+            src: [B,] 
+            dst: [B,] 
+        Return:
+            pred_logit: [B,1]
         """
-        ### 0. unpack event dict
-        pos_src=pos_edge["src"]
-        pos_dst=pos_edge["dst"]
-        neg_src=neg_edge["src"]
-        neg_dst=neg_edge["dst"]
-
-        src=torch.concat([pos_src,neg_src],dim=0) # [2B,]
-        dst=torch.concat([pos_dst,neg_dst],dim=0) # [2B,]
-
         ### 1. current batch에 대한 embedding
         src_ft=self.node_ft(src)
         dst_ft=self.node_ft(dst)
-
-        link_ft=torch.concat([src_ft,dst_ft],dim=-1) # [2B,embed_dim+embed_dim]
-        pred_link_logit=self.decoder(link_ft) # [2B,1]
-        return pred_link_logit
+        pair_vec=torch.concat([src_ft,dst_ft],dim=-1) # [B,embed_dim+embed_dim]
+        pred_logit=self.decoder(pair_vec) # [B,1]
+        return pred_logit

@@ -1,10 +1,8 @@
-import random
-import math
+import pandas as pd
 import numpy as np
 import networkx as nx
-from typing import Literal
-from collections import defaultdict,deque
-from utils import SamplingUtils
+from collections import deque
+from utils import RandomWalkUtils
 from .temporal_graph import TemporalGraph
 
 class ATDGEB_Graph(TemporalGraph):
@@ -27,15 +25,58 @@ class ATDGEB_Graph(TemporalGraph):
     
     """
     def __init__(self,
-            graph_df,
+            graph_df:pd.DataFrame,
+            train_df:pd.DataFrame,
             bipartite:bool=False
         ):
         super().__init__(
             graph_df=graph_df,
             bipartite=bipartite
         )
+        # set graph_df for training
+        self.train_df=train_df
+        train_adj=[[] for _ in range(self.n_node+1)]
+        train_adj_edge=[[] for _ in range(self.n_node+1)]
+        train_adj_t=[[] for _ in range(self.n_node+1)]
+        self.train_edge_events=[]
+        for event in train_df.itertuples(index=False): # col: [u,i,ts,idx=edge_id]
+            src=int(event.u)
+            dst=int(event.i)
+            t=float(event.t)
+            edge_id=int(event.idx)
+            # edge 양방향 저장
+            train_adj[dst].append(src)
+            train_adj_edge[dst].append(edge_id)
+            train_adj_t[dst].append(t)
+            train_adj[src].append(dst)
+            train_adj_edge[src].append(edge_id)
+            train_adj_t[src].append(t)
+            # edge event 저장
+            self.train_edge_events.append((src,dst,t,edge_id))
+
+        # TemporalGraph의 adjacency 표현과 동일하게 노드별 NumPy
+        # 배열로 저장한다. train_df는 시간순 정렬되어 있다고 가정한다.
+        self.train_adj=[
+            np.asarray(values,dtype=np.int64)
+            for values in train_adj
+        ]
+        self.train_adj_edge=[
+            np.asarray(values,dtype=np.int64)
+            for values in train_adj_edge
+        ]
+        self.train_adj_t=[
+            np.asarray(values,dtype=np.float64)
+            for values in train_adj_t
+        ]
+
+        # set train_n_node, train_n_event, train_max_t
+        self.train_n_node=max(train_df["u"].max(),train_df["i"].max())
+        self.train_n_event=train_df["idx"].max()
+        self.train_max_t=train_df["t"].max()
+
+        # setting for random walk
         self.topological_graph=nx.from_pandas_edgelist(
-            self.graph_df,
+            self.train_df,
             source="u",
             target="i",
             create_using=nx.Graph() # Undirected Graph
@@ -175,7 +216,7 @@ class ATDGEB_Graph(TemporalGraph):
                 struct_dim,
                 dtype=np.float32
             )
-            for _ in range(self.n_node+1)
+            for _ in range(self.train_n_node+1)
         ]
 
         level_to_idx={
@@ -200,12 +241,12 @@ class ATDGEB_Graph(TemporalGraph):
         return local_struct_vec
 
     def aggregate_local_struct_vec(self,
-            L:int
+            n_aggr:int
         )->list[np.ndarray]:
         """
         Input:
             init_stru: init local structure vector list
-            L: aggregate 반복 횟수
+            n_aggr: aggregate 반복 횟수
         Output:
             stru: aggregated local structure vector list
         """
@@ -224,14 +265,14 @@ class ATDGEB_Graph(TemporalGraph):
         # node 0은 padding node
         stru[0].fill(0.0)
 
-        for _ in range(L):
+        for _ in range(n_aggr):
             # 현재 layer 계산에는 이전 layer의 벡터만 사용
             prev_stru=stru
             next_stru=[
                 vec.copy()
                 for vec in prev_stru
             ]
-            for node in range(1,self.n_node+1):
+            for node in self.topological_graph.nodes:
                 neighbors=list(
                     self.topological_graph.neighbors(node)
                 )
@@ -240,7 +281,7 @@ class ATDGEB_Graph(TemporalGraph):
                     continue
 
                 similarities=np.asarray([
-                    SamplingUtils.compute_similarity(
+                    RandomWalkUtils.compute_similarity(
                         prev_stru[node],
                         prev_stru[neighbor]
                     )
@@ -296,7 +337,7 @@ class ATDGEB_Graph(TemporalGraph):
             visit_prob[node]={}
             for neighbor in self.topological_graph.neighbors(node):
                 neighbor=int(neighbor)
-                visit_prob[node][neighbor]=SamplingUtils.compute_similarity(
+                visit_prob[node][neighbor]=RandomWalkUtils.compute_similarity(
                     vec_a=self.stru[node],
                     vec_b=self.stru[neighbor]
                 )
@@ -330,7 +371,7 @@ class ATDGEB_Graph(TemporalGraph):
         active_times=sorted(
             set(
                 float(timestamp)
-                for timestamp in self.adj_t.get(node,[])
+                for timestamp in self.train_adj_t[node]
             )
         )
         n_active_time=len(active_times)
@@ -397,7 +438,6 @@ class ATDGEB_Graph(TemporalGraph):
 
                 if labels[neighbor_idx]==-1:
                     labels[neighbor_idx]=cluster_id
-
             cluster_id+=1
 
         time_intervals=[]
@@ -436,7 +476,9 @@ class ATDGEB_Graph(TemporalGraph):
     def local_structure_biased_sampling(self,
             node:int,
             walk_path:list[int],
-            time_interval:tuple[float,float]
+            time_interval:tuple[float,float],
+            start_inclusive:bool=True,
+            excluded_neighbors:set[int]|None=None
         )->int|None:
         """
         Local Structure Biased Sampling (LSBS)
@@ -445,6 +487,8 @@ class ATDGEB_Graph(TemporalGraph):
             node: 현재 노드
             walk_path: 현재까지 생성된 walk path
             time_interval: walk가 허용되는 시간 구간
+            start_inclusive: time_interval의 시작 시각 포함 여부
+            excluded_neighbors: 현재 tree node에서 이미 샘플된 이웃
         Output:
             sampled_neighbor: 선택된 다음 이웃 노드, 시간 구간 안에 방문 가능한 이웃이 없으면 None
         """
@@ -464,17 +508,30 @@ class ATDGEB_Graph(TemporalGraph):
             raise ValueError(
                 "walk_path의 마지막 노드는 현재 node와 같아야 합니다."
             )
+        excluded_neighbors=(
+            set()
+            if excluded_neighbors is None
+            else excluded_neighbors
+        )
 
         # 동일한 이웃과 여러 번 접촉했더라도 sampling 후보에는 한 번만 포함한다.
         # 주어진 시간 구간에 접촉한 이웃만 선택한다.
         candidate_neighbors=[] # 실제 샘플링에 사용할 이웃 목록
         candidate_set=set() # 같은 이웃이 중복으로 추가되는 것을 방지하는 집합
         for neighbor,timestamp in zip(
-                self.adj.get(node,[]),
-                self.adj_t.get(node,[])
+                self.train_adj[node],
+                self.train_adj_t[node]
             ):
+            neighbor=int(neighbor)
+            timestamp=float(timestamp)
             if (
-                start_time<=timestamp<=end_time
+                (
+                    start_time<=timestamp
+                    if start_inclusive
+                    else start_time<timestamp
+                )
+                and timestamp<=end_time
+                and neighbor not in excluded_neighbors
                 and neighbor not in candidate_set
             ):
                 candidate_neighbors.append(neighbor)
@@ -528,7 +585,7 @@ class ATDGEB_Graph(TemporalGraph):
             if any(weight>0.0 for weight in weights)
             else None
         )
-        return SamplingUtils.random_sampling(
+        return RandomWalkUtils.random_sampling(
             rng=self.rng,
             population=candidate_neighbors,
             weights=sampling_weights
@@ -537,8 +594,8 @@ class ATDGEB_Graph(TemporalGraph):
     def get_walks_using_path_tree(self,
             node:int,
             time_interval:tuple[float,float],
-            max_walk_len:int=20,
-            n_sampling:int=1
+            walk_len:int=20,
+            n_lsbs:int=1
         )->list[list[int]]:
         """
         논문의 Algorithm 3 PathTree에 따라 주어진 시간 구간에서
@@ -547,8 +604,8 @@ class ATDGEB_Graph(TemporalGraph):
         Input:
             node: path tree의 root node
             time_interval: walk가 허용되는 시간 구간
-            max_walk_len: 하나의 walk에 포함할 최대 노드 수
-            n_sampling: 각 tree node에서 수행할 최대 LSBS 횟수
+            walk_len: 하나의 walk에 포함할 최대 노드 수
+            n_path: 각 tree node에서 수행할 최대 LSBS 횟수
         Output:
             walks: list[list[int]], list of walk path
         """
@@ -562,13 +619,13 @@ class ATDGEB_Graph(TemporalGraph):
             raise ValueError(
                 "time_interval의 시작 시간은 종료 시간보다 클 수 없습니다."
             )
-        if max_walk_len<1:
+        if walk_len<1:
             raise ValueError(
-                "max_walk_len은 1 이상이어야 합니다."
+                "walk_len은 1 이상이어야 합니다."
             )
-        if n_sampling<1:
+        if n_lsbs<1:
             raise ValueError(
-                "n_sampling 1 이상이어야 합니다."
+                "n_lsbs 1 이상이어야 합니다."
             )
 
         # 각 queue item은 논문의 tree node instance에 해당한다.
@@ -592,7 +649,7 @@ class ATDGEB_Graph(TemporalGraph):
             walk_path=tree_node["walk_path"]
             visited_states=tree_node["visited_states"]
 
-            if len(walk_path)>=max_walk_len:
+            if len(walk_path)>=walk_len:
                 walks.append(walk_path)
                 continue
 
@@ -615,11 +672,22 @@ class ATDGEB_Graph(TemporalGraph):
             # 시간 도달성을 만족하는 서로 다른 이웃과 각 이웃으로
             # 이동할 수 있는 가장 이른 arrival time을 구한다.
             eligible_arrival_times={}
+            interval_neighbors=set()
             for neighbor,timestamp in zip(
-                    self.adj.get(current_node,[]),
-                    self.adj_t.get(current_node,[])
+                    self.train_adj[current_node],
+                    self.train_adj_t[current_node]
                 ):
-                if candidate_start<=timestamp<=end_time:
+                neighbor=int(neighbor)
+                timestamp=float(timestamp)
+                is_after_start=(
+                    candidate_start<=timestamp
+                    if arrival_time is None
+                    else candidate_start<timestamp
+                )
+                if is_after_start and timestamp<=end_time:
+                    interval_neighbors.add(neighbor)
+                    if (neighbor,timestamp) in visited_states:
+                        continue
                     previous_timestamp=eligible_arrival_times.get(
                         neighbor
                     )
@@ -635,27 +703,38 @@ class ATDGEB_Graph(TemporalGraph):
 
             # 모든 유효 이웃을 매 단계 확장하면 path tree의 크기가
             # 지수적으로 증가하므로 지정한 횟수까지만 LSBS를 수행한다.
-            n_sampling=min(
+            n_current_lsbs=min(
                 len(eligible_arrival_times),
-                n_sampling
+                n_lsbs
             )
             sampled_children=set()
             child_created=False
 
-            for _ in range(n_sampling):
+            for _ in range(n_current_lsbs):
                 sampled_neighbor=self.local_structure_biased_sampling(
                     node=current_node,
                     walk_path=walk_path,
                     time_interval=(
                         candidate_start,
                         end_time
+                    ),
+                    # root의 첫 edge는 interval start를 포함하고,
+                    # 이후 edge는 직전 arrival time보다 엄격히 커야 한다.
+                    start_inclusive=arrival_time is None,
+                    # Algorithm 3의 한 tree node에서 같은 child를
+                    # 중복 생성하지 않도록 비복원 샘플링한다.
+                    # 이미 방문한 time-expanded state만 가진 이웃도
+                    # 샘플링 후보에서 제외한다.
+                    excluded_neighbors=(
+                        sampled_children
+                        | (
+                            interval_neighbors
+                            - eligible_arrival_times.keys()
+                        )
                     )
                 )
-                if (
-                    sampled_neighbor is None
-                    or sampled_neighbor in sampled_children
-                ):
-                    continue
+                if sampled_neighbor is None:
+                    break
 
                 sampled_children.add(sampled_neighbor)
                 next_arrival_time=eligible_arrival_times[
@@ -696,16 +775,14 @@ class ATDGEB_Graph(TemporalGraph):
             # 경우에도 현재 tree node는 leaf이다.
             if not child_created:
                 walks.append(walk_path)
-
         return walks
 
     def generate_walks(self,
             k_list:list,
-            L:int,
+            n_aggr:int,
             min_points:int=2,
-            max_walk_len:int=20,
-            n_sampling:int=1,
-            seed:int=1
+            walk_len:int=20,
+            n_lsbs:int=1
         )->list[list[str]]:
         """
         Local structure vector와 visit probability를 계산한 뒤,
@@ -714,25 +791,23 @@ class ATDGEB_Graph(TemporalGraph):
 
         Input:
             k_list: community detection에 사용할 k 목록
-            L: local structure vector aggregation 반복 횟수
-            min_points: DBSCAN core point를 판별할 최소 이웃 수
-            max_walk_len: 하나의 walk에 포함할 최대 노드 수
-            n_sampling: 각 tree node에서 수행할 최대 LSBS 횟수
+            n_aggr: local structure vector aggregation 반복 횟수
+            min_points: Adaptive Walk Strategy를 위한 DBSCAN core point를 판별할 최소 이웃 수
+            walk_len: 하나의 walk에 포함할 최대 노드 수
+            n_lsbs: 각 tree node에서 수행할 최대 LSBS 횟수
         Output:
             walks: list[list[str]], list of walk path
         """
-        if L<0:
+        if n_aggr<0:
             raise ValueError(
-                "L은 0 이상이어야 합니다."
+                "n_aggr은 0 이상이어야 합니다."
             )
-        self.set_random_seed(seed=seed)
-
         self.generate_init_local_struct_vec(k_list=k_list)
-        self.aggregate_local_struct_vec(L=L)
+        self.aggregate_local_struct_vec(n_aggr=n_aggr)
         self.compute_visit_prob()
 
         walks=[]
-        for node in range(1,self.n_node+1):
+        for node in self.topological_graph.nodes:
             node=int(node)
             time_intervals=self.DBSCAN_clustering(
                 node=node,
@@ -743,8 +818,8 @@ class ATDGEB_Graph(TemporalGraph):
                 node_walks=self.get_walks_using_path_tree(
                     node=node,
                     time_interval=time_interval,
-                    max_walk_len=max_walk_len,
-                    n_sampling=n_sampling
+                    walk_len=walk_len,
+                    n_lsbs=n_lsbs
                 )
                 walks.extend(
                     [
